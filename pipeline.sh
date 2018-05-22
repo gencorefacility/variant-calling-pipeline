@@ -22,7 +22,7 @@ BEDTOOLS='bedtools/intel/2.26.0'
 BWA='bwa/intel/0.7.15'
 PICARD='picard/2.8.2'
 GATK='gatk/3.7-0'
-R='r/intel/3.3.2'
+R='r/intel/3.4.2'
 SAMTOOLS='samtools/intel/1.3.1'
 SNPEFF='snpeff/4.3i'
 
