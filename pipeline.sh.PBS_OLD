@@ -1,0 +1,410 @@
+#!/bin/bash
+
+## Hard Code Params
+DIR='/data/cgsb/gencore/out/Gresham/2015-10-23_HK5NHBGXX/lib1-26/'
+REF='/scratch/work/cgsb/reference_genomes/Public/Fungi/Saccharomyces_cerevisiae/GCF_000146045.2_R64/GCF_000146045.2_R64_genomic.fna'
+SNPEFF_DB='GCF_000146045.2_R64'
+PL='illumina'
+PM='nextseq'
+EMAIL=${USER}@nyu.edu
+
+## Or Set Params via Command Line
+#DIR=$1 #DIRECTORY WITH FASTQ FILES TO PROCESS
+#REF=$2 #UNCOMPRESSED VERSION OF GENOMIC.FNA FILE
+#SNPEFFDB=$3    #SNPEFF DB TO USE
+#PL=$4  #EX: illumina
+#PM=$5  #EX: nextseq
+#EMAIL=$6 #EX: netID@nyu.edu
+
+
+## Modules Used in this script
+BEDTOOLS='bedtools/intel/2.25.0'
+BWA='bwa/gnu/0.7.8'
+PICARD='picard-tools/1.129'
+GATK='gatk/3.3-0'
+R='r/intel/3.2.2'
+SAMTOOLS='samtools/intel/1.3'
+SNPEFF='snpeff/4.1g'
+
+## Paths to Modules
+PICARD_JAR='/share/apps/picard-tools/1.129/picard.jar'
+GATK_JAR='/share/apps/gatk/3.3-0/GenomeAnalysisTK.jar'
+SNPEFF_JAR='/share/apps/snpeff/4.1g/snpEff.jar'
+
+## Get the current working directory
+WD="$(pwd)"
+
+## Steps of the Workflow
+pre_process(){
+alignment=\
+$(echo \
+"cd $FWD && \
+module load $BWA && \
+bwa mem -M -R '@RG\tID:$file\tLB:$file\tPL:$PL\tPM:$PM\tSM:$file' \
+$REF \
+$INPUT_1 $INPUT_2 \
+> ${ID}_aligned_reads.sam" \
+| qsub -m a -M $EMAIL -j oe -N $ID.bwa -l walltime=4:00:00,nodes=1:ppn=1,mem=8GB)
+	echo $alignment > $ID.log
+	echo "ALIGNMENT: " $alignment
+	echo "Alignment Submitted"
+
+samToSortedBam=\
+$(echo \
+"cd $FWD && \ 
+module load $PICARD && \
+java -jar $PICARD_JAR \
+SortSam \
+INPUT=${ID}_aligned_reads.sam \
+OUTPUT=${ID}_sorted_reads.bam \
+SORT_ORDER=coordinate" \
+| qsub -m a -M $EMAIL -j eo -N $ID.samToSortedBam -W depend=afterok:$alignment -l walltime=4:00:00,nodes=1:ppn=1,mem=8GB)
+	echo $samToSortedBam >> $ID.log
+	echo "samToSortedBam Submitted"
+
+getMetrics=\
+$(echo \
+"cd $FWD && \
+module  load $PICARD && \
+module load $R && \
+module load $SAMTOOLS && \
+java -jar $PICARD_JAR \
+CollectAlignmentSummaryMetrics \
+R=$REF \
+I=${ID}_sorted_reads.bam \
+O=${ID}_alignment_metrics.txt && \
+java -jar $PICARD_JAR \
+CollectInsertSizeMetrics \
+INPUT=${ID}_sorted_reads.bam \
+OUTPUT=${ID}_insert_metrics.txt \
+HISTOGRAM_FILE=${ID}_insert_size_histogram.pdf && \
+samtools depth -a ${ID}_sorted_reads.bam > ${ID}_depth_out.txt" \
+| qsub -m a -M $EMAIL -j eo -N $ID.getMetrics -W depend=afterok:$samToSortedBam -l walltime=4:00:00,nodes=1:ppn=1,mem=8GB) 
+	echo $getMetrics >> $ID.log
+	echo "getMetrics Submitted"
+
+
+markDuplicates=\
+$(echo \
+"cd $FWD && \ 
+rm ${ID}_aligned_reads.sam && \
+module load $PICARD && \
+java -jar $PICARD_JAR \
+MarkDuplicates \
+INPUT=${ID}_sorted_reads.bam \
+OUTPUT=${ID}_dedup_reads.bam \
+METRICS_FILE=${ID}_metrics.txt" \
+| qsub -m a -M $EMAIL -j eo -N $ID.markDuplicates -W depend=afterok:$samToSortedBam -l walltime=4:00:00,nodes=1:ppn=1,mem=8GB)
+	echo $markDuplicates >> $ID.log
+	echo "Mark Duplicates Submitted"
+
+buildBamIndex=\
+$(echo \
+"cd $FWD && \ 
+module load $PICARD && \
+java -jar $PICARD_JAR \
+BuildBamIndex \
+INPUT=${ID}_dedup_reads.bam" \
+| qsub -m a -M $EMAIL -j eo -N $ID.buildBamIndex -W depend=afterok:$markDuplicates -l walltime=4:00:00,nodes=1:ppn=1,mem=8GB)
+	echo $buildBamIndex >> $ID.log
+	echo "BuildBamIndex Submitted"
+
+realignTargetCreator=\
+$(echo \
+"cd $FWD && \ 
+rm ${ID}_sorted_reads.bam && \
+module load $GATK && \
+java -jar $GATK_JAR \
+-T RealignerTargetCreator \
+-R $REF \
+-I ${ID}_dedup_reads.bam \
+-o ${ID}_realignment_targets.list" \
+| qsub -m a -M $EMAIL -j eo -N $ID.realignTargetCreator -W depend=afterok:$buildBamIndex -l walltime=4:00:00,nodes=1:ppn=1,mem=8GB)
+	echo $realignTargetCreator >> $ID.log
+	echo "RealignTargetCreator Submitted"
+
+realignIndels=\
+$(echo \
+"cd $FWD && \ 
+module load $GATK && \
+java -jar $GATK_JAR \
+-T IndelRealigner \
+-R $REF \
+-I ${ID}_dedup_reads.bam \
+-targetIntervals ${ID}_realignment_targets.list \
+-o ${ID}_realigned_reads.bam" \
+| qsub -m a -M $EMAIL -j eo -N $ID.realignIndels -W depend=afterok:$realignTargetCreator -l walltime=4:00:00,nodes=1:ppn=1,mem=8GB)
+	echo $realignIndels >> $ID.log
+	echo "RealignIndels Submitted"	
+}
+
+call_variants(){
+	ROUND=$1
+	if [[ $ROUND -eq 1 ]];then
+		INPUT=${ID}_realigned_reads.bam
+		OUTPUT=${ID}_raw_variants.vcf
+		AFTEROKSTEP=$realignIndels
+	fi
+	if [[ $ROUND -eq 2 ]];then
+		INPUT=${ID}_recal_reads.bam
+		OUTPUT=${ID}_raw_variants_recal.vcf
+		AFTEROKSTEP=$applyBqsr
+	fi
+
+callVariants=\
+$(echo \
+"cd $FWD && \
+module load $GATK && \
+java -jar $GATK_JAR \
+-T HaplotypeCaller \
+-R $REF \
+-I $INPUT \
+-o $OUTPUT" \
+| qsub -m a -M $EMAIL -j eo -N $ID.CallVariants$ROUND -W depend=afterok:$AFTEROKSTEP -l walltime=4:00:00,nodes=1:ppn=1,mem=8GB)
+	echo $callVariants >> $ID.log
+	echo "Variant Calling Round $ROUND Submitted"
+	
+	if [[ $ROUND -eq 1 ]];then
+		callVariants_1=$callVariants
+	fi
+	if [[ $ROUND -eq 2 ]];then
+		callVariants_2=$callVariants
+	fi
+}
+
+## extracts snps AND indels, separately
+extract_snps(){
+        ROUND=$1
+        if [[ $ROUND -eq 1 ]];then
+		V=${ID}_raw_variants.vcf
+		OS=${ID}_raw_snps.vcf
+		OI=${ID}_raw_indels.vcf
+		AFTEROK=$callVariants_1
+        fi
+        if [[ $ROUND -eq 2 ]];then
+		V=${ID}_raw_variants_recal.vcf
+		OS=${ID}_raw_snps_recal.vcf
+		OI=${ID}_raw_indels_recal.vcf
+		AFTEROK=$callVariants_2
+        fi
+extractSnps=\
+$(echo \
+"cd $FWD &&\
+module load $GATK && \
+java -jar $GATK_JAR \
+-T SelectVariants \
+-R $REF \
+-V $V \
+-selectType SNP \
+-o $OS && \
+java -jar $GATK_JAR \
+-T SelectVariants \
+-R $REF \
+-V $V \
+-selectType INDEL \
+-o $OI" \
+| qsub -m a -M $EMAIL -j eo -N $ID.ExtractSNPs_$ROUND -W depend=afterok:$AFTEROK -l walltime=4:00:00,nodes=1:ppn=1,mem=8GB)
+        echo $extractSnps >> $ID.log
+        echo "Extract SNPs Round $ROUND Submitted"
+
+        if [[ $ROUND -eq 1 ]];then
+                extractSnps_1=$extractSnps
+        fi
+        if [[ $ROUND -eq 2 ]];then
+                extractSnps_2=$extractSnps
+        fi
+}
+
+filter_snps(){
+        ROUND=$1
+        if [[ $ROUND -eq 1 ]];then
+                V=${ID}_raw_snps.vcf
+		O=${ID}_filtered_snps.vcf
+                AFTEROK=$extractSnps_1
+        fi
+        if [[ $ROUND -eq 2 ]];then
+                V=${ID}_raw_snps_recal.vcf
+                O=${ID}_filtered_snps_final.vcf
+                AFTEROK=$extractSnps_2
+        fi
+
+filterSnps=\
+$(echo \
+"cd $FWD && \
+module load $GATK && \
+java -jar $GATK_JAR \
+-T VariantFiltration \
+-R $REF \
+-V $V \
+--filterExpression 'QD < 2.0 || FS > 60.0 || MQ < 40.0 || MQRankSum < -12.5 || ReadPosRankSum < -8.0 || SOR > 4.0' \
+--filterName "basic_snp_filter" \
+-o $O" \
+| qsub -m a -M $EMAIL -j eo -N $ID.FilterSNPs$ROUND -W depend=afterok:$AFTEROK -l walltime=4:00:00,nodes=1:ppn=1,mem=8GB)
+        echo $filterSnps >> $ID.log
+        echo "Filter SNPs Round $ROUND Submitted"
+
+        if [[ $ROUND -eq 1 ]];then
+                filterSnps_1=$filterSnps
+        fi
+        if [[ $ROUND -eq 2 ]];then
+                filterSnps_2=$filterSnps
+        fi
+}
+
+filter_indels(){
+        ROUND=$1
+        if [[ $ROUND -eq 1 ]];then
+                V=${ID}_raw_indels.vcf
+                O=${ID}_filtered_indels.vcf
+                AFTEROK=$extractSnps_1
+        fi
+        if [[ $ROUND -eq 2 ]];then
+                V=${ID}_raw_indels_recal.vcf
+                O=${ID}_filtered_indels_final.vcf
+                AFTEROK=$extractSnps_2
+        fi
+
+filterIndels=\
+$(echo \
+"cd $FWD && \
+module load $GATK && \
+java -jar $GATK_JAR \
+-T VariantFiltration \
+-R $REF \
+-V $V \
+--filterExpression 'QD < 2.0 || FS > 200.0 || ReadPosRankSum < -20.0 || SOR > 10.0' \
+--filterName "basic_indel_filter" \
+-o $O" \
+| qsub -m a -M $EMAIL -j eo -N $ID.FilterIndels$ROUND -W depend=afterok:$AFTEROK -l walltime=4:00:00,nodes=1:ppn=1,mem=8GB)
+        echo $filterIndels >> $ID.log
+        echo "Filter Indels Round $ROUND Submitted"
+
+}
+
+do_bqsr(){
+	#todo: knownSites input shouldn't be full raw_variants.vcf file but only the TOP variants!
+	ROUND=$1
+	if [[ $ROUND -eq 1 ]];then
+		POST=''
+		OUT=${ID}_recal_data.table
+		AFTEROKSTEP="$filterSnps_1:$filterIndels"
+	fi
+	if [[ $ROUND -eq 2 ]];then
+		POST='-BQSR '${ID}_recal_data.table
+		OUT=${ID}_post_recal_data.table
+		AFTEROKSTEP=$bqsr_1
+	fi
+
+bqsr=\
+$(echo \
+"cd $FWD && \
+module load $GATK && \
+java -jar $GATK_JAR \
+-T BaseRecalibrator \
+-R $REF \
+-I ${ID}_realigned_reads.bam \
+-knownSites ${ID}_filtered_snps.vcf \
+-knownSites ${ID}_filtered_indels.vcf \
+$POST \
+-o $OUT" \
+| qsub -m a -M $EMAIL -j eo -N $ID.BQSR$ROUND -W depend=afterok:$AFTEROKSTEP -l walltime=4:00:00,nodes=1:ppn=1,mem=8GB)
+	echo $bqsr >> $ID.log
+	echo "BQSR Round $ROUND Submitted"
+
+	if [[ $ROUND -eq 1 ]];then
+		bqsr_1=$bqsr
+	fi
+	if [[ $ROUND -eq 2 ]];then
+		bqsr_2=$bqsr
+	fi
+}
+
+analyze_covariates(){
+analyzeCovariates=\
+$(echo \
+"cd $FWD && \
+module load $GATK && \
+module load $R && \
+java -jar $GATK_JAR \
+-T AnalyzeCovariates \
+-R $REF \
+-before ${ID}_recal_data.table \
+-after ${ID}_post_recal_data.table \
+-plots ${ID}_recalibration_plots.pdf" \
+| qsub -m a -M $EMAIL -j eo -N $ID.analyzeCovariates -W depend=afterok:$bqsr_2 -l walltime=4:00:00,nodes=1:ppn=1,mem=8GB)
+	echo $analyzeCovariates >> $ID.log
+	echo "AnalyzeCovariates Submitted"
+}
+
+apply_bqsr(){
+applyBqsr=\
+$(echo \
+"cd $FWD && \
+rm ${ID}_dedup_reads.bam ${ID}_dedup_reads.bai && \
+module load $GATK && \
+java -jar $GATK_JAR \
+-T PrintReads \
+-R $REF \
+-I ${ID}_realigned_reads.bam \
+-BQSR ${ID}_recal_data.table \
+-o ${ID}_recal_reads.bam" \
+| qsub -m a -M $EMAIL -j eo -N $ID.applyBQSR -W depend=afterok:$bqsr_2 -l walltime=4:00:00,nodes=1:ppn=1,mem=8GB)
+	echo $applyBqsr >> $ID.log
+	echo "Apply BQSR Submitted"
+}
+
+parse_metrics(){
+parseMetrics=\
+$(echo \
+"cd $FWD && \
+module load $BEDTOOLS && \
+bedtools genomecov -bga -ibam ${ID}_recal_reads.bam > ${ID}_genomecov.bedgraph && \
+sh /scratch/work/cgsb/scripts/variant_calling/parse_metrics.sh $ID"\
+| qsub -m a -M  $EMAIL -j eo -N $ID.parseMetrics -W depend=afterok:$filterSnps_2 -l walltime=1:00:00,nodes=1:ppn=1,mem=1GB)
+        echo "ParseMetrics Submitted"
+}
+
+do_snpeff(){
+snpEff=\
+$(echo \
+"cd $FWD && \
+module load $SNPEFF && \
+java -jar $SNPEFF_JAR \
+-v $SNPEFF_DB \
+${ID}_filtered_snps_final.vcf > ${ID}_filtered_snps_final.ann.vcf" \
+| qsub -m a -M mk5636@nyu.edu -j eo -N $file.SnpEFF  -W depend=afterok:$filterSnps_2 -l walltime=4:00:00,nodes=1:ppn=1,mem=8GB)
+        echo "SnpEFF submitted: $snpEff"
+}
+
+## Build Report Header and Create File
+REPORT_HEADER="ID,# reads,aligned reads,% aligned,aligned bases,read length,% paired,mean insert size,# SNPs 1,# SNPs 1 filtered,# SNPs 2, # SNPs filtered 2,average coverage"
+echo $REPORT_HEADER > report.csv
+
+for file in $(ls $DIR/*fastq.gz | perl -pe 's/^.+n0\d_(.+)\.fastq\.gz/$1/g' | sort | uniq)
+do
+	INPUT_1=$(ls $DIR/*n01_$file.fastq.gz)
+	INPUT_2=$(ls $DIR/*n02_$file.fastq.gz)
+	ID=$file
+
+	echo "Processing files: " $INPUT_1 ", " $INPUT_2
+	FWD=$WD/$ID
+	mkdir $FWD
+	cd $FWD
+
+	## CALL WORKFLOW
+	pre_process # Only Done Once
+	call_variants 1 # Call Variants Round 1
+	extract_snps 1 # Round 1. Extracts snps AND indels, separately
+	filter_snps 1 # Round 1
+	filter_indels 1 # Round 1
+	do_bqsr 1 # Do BQSR Round 1
+	do_bqsr 2 # Do BQSR Round 2
+	analyze_covariates # Only Done Once
+	apply_bqsr # Only Done Once
+	call_variants 2 # Call Variants Round 2
+	extract_snps 2 # Round 2. Extracts snps AND indels, separately
+	filter_snps 2 # Round 2
+	filter_indels 2 # Round 2
+	parse_metrics
+	do_snpeff
+done
